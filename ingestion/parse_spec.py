@@ -45,6 +45,10 @@ def is_sc_node(tag: Tag) -> Optional[Tuple[str, str]]:
         return parse_sc_from_text(txt)
     return None
 
+def is_major_section_heading(tag: Tag) -> bool:
+    """True if this tag is a top-level section heading (used to stop the last SC from eating later sections)."""
+    return tag.name == "h2"
+
 def collect_until_next_sc(start_node: Tag) -> str:
     parts: List[str] = []
 
@@ -54,6 +58,8 @@ def collect_until_next_sc(start_node: Tag) -> str:
     for el in start_node.next_elements:
         if isinstance(el, Tag):
             if el is not start_node and is_sc_node(el):
+                break
+            if el is not start_node and is_major_section_heading(el):
                 break
 
             # skip nav-like sections
