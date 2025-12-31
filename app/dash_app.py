@@ -1,37 +1,11 @@
 import os
-from functools import lru_cache
 
 import dash
 from dash import html, dcc, Input, Output, State
-import chromadb
-from sentence_transformers import SentenceTransformer
+
+from rag.llm_rag import answer_with_llm
 
 PERSIST_DIR = os.path.join("data", "vectorstore", "chroma_wcag22")
-COLLECTION_NAME = "wcag22_spec"
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-
-@lru_cache(maxsize=1)
-def get_model():
-    return SentenceTransformer(EMBED_MODEL_NAME)
-
-
-@lru_cache(maxsize=1)
-def get_collection():
-    client = chromadb.PersistentClient(path=PERSIST_DIR)
-    return client.get_collection(COLLECTION_NAME)
-
-
-def run_search(query: str, k: int = 5):
-    model = get_model()
-    col = get_collection()
-    q_emb = model.encode([query], normalize_embeddings=True)[0].tolist()
-
-    return col.query(
-        query_embeddings=[q_emb],
-        n_results=k,
-        include=["documents", "metadatas", "distances"]
-    )
 
 
 def result_card(i, meta, dist, doc):
@@ -47,7 +21,10 @@ def result_card(i, meta, dist, doc):
                 [
                     html.Span(f"{i+1}. {title}", style={"fontWeight": 600}),
                     html.Span(f"  |  Level: {level}", style={"marginLeft": "12px"}),
-                    html.Span(f"  |  dist={dist:.4f}", style={"marginLeft": "12px", "color": "#666"}),
+                    html.Span(
+                        f"  |  dist={dist:.4f}",
+                        style={"marginLeft": "12px", "color": "#666"},
+                    ),
                 ]
             ),
             html.Div(
@@ -57,7 +34,7 @@ def result_card(i, meta, dist, doc):
                             html.Span("Source: "),
                             html.A(url, href=url, target="_blank", rel="noreferrer"),
                         ],
-                        style={"marginTop": "8px"}
+                        style={"marginTop": "8px"},
                     ),
                     html.Pre(
                         snippet,
@@ -85,17 +62,16 @@ def result_card(i, meta, dist, doc):
 
 
 app = dash.Dash(__name__)
-app.title = "WCAG 2.2 Retrieval Demo (Spec-only)"
+app.title = "WCAG 2.2 RAG Demo (Spec-only)"
 
 app.layout = html.Div(
     style={"maxWidth": "980px", "margin": "24px auto", "fontFamily": "system-ui, Arial"},
     children=[
-        html.H2("WCAG 2.2 Retrieval Demo (Spec-only)"),
+        html.H2("WCAG 2.2 RAG Demo (Spec-only)"),
         html.Div(
-            "Retrieves normative WCAG 2.2 Success Criterion text from a local vector index (Chroma).",
+            "Answers questions using normative WCAG 2.2 Success Criterion text from a local vector index (Chroma) + an LLM.",
             style={"color": "#555", "marginBottom": "16px"},
         ),
-
         html.Div(
             style={"display": "flex", "gap": "12px", "alignItems": "flex-end"},
             children=[
@@ -107,7 +83,12 @@ app.layout = html.Div(
                             id="query",
                             type="text",
                             value="Is focus allowed to be obscured?",
-                            style={"width": "100%", "padding": "10px", "borderRadius": "8px", "border": "1px solid #ccc"},
+                            style={
+                                "width": "100%",
+                                "padding": "10px",
+                                "borderRadius": "8px",
+                                "border": "1px solid #ccc",
+                            },
                         ),
                     ],
                 ),
@@ -117,24 +98,48 @@ app.layout = html.Div(
                         html.Label("Top-k"),
                         dcc.Slider(
                             id="topk",
-                            min=3, max=10, step=1, value=5,
+                            min=3,
+                            max=10,
+                            step=1,
+                            value=5,
                             marks={i: str(i) for i in range(3, 11)},
                             tooltip={"placement": "bottom", "always_visible": False},
                         ),
                     ],
                 ),
                 html.Button(
-                    "Search",
+                    "Ask",
                     id="search_btn",
                     n_clicks=0,
-                    style={"padding": "10px 16px", "borderRadius": "10px", "border": "1px solid #333", "cursor": "pointer"},
+                    style={
+                        "padding": "10px 16px",
+                        "borderRadius": "10px",
+                        "border": "1px solid #333",
+                        "cursor": "pointer",
+                    },
                 ),
             ],
         ),
-
         html.Div(id="status", style={"marginTop": "14px"}),
         html.Hr(style={"margin": "18px 0"}),
-
+        html.H3("Answer"),
+        dcc.Loading(
+            type="default",
+            children=html.Div(
+                id="answer_box",
+                style={
+                    "whiteSpace": "pre-wrap",
+                    "background": "white",
+                    "border": "1px solid #e5e5e5",
+                    "borderRadius": "12px",
+                    "padding": "14px",
+                },
+            ),
+        ),
+        html.H3("Citations"),
+        html.Div(id="citations_box"),
+        html.Hr(style={"margin": "18px 0"}),
+        html.H3("Retrieved chunks (debug)"),
         html.Div(id="results"),
     ],
 )
@@ -142,6 +147,8 @@ app.layout = html.Div(
 
 @app.callback(
     Output("status", "children"),
+    Output("answer_box", "children"),
+    Output("citations_box", "children"),
     Output("results", "children"),
     Input("search_btn", "n_clicks"),
     State("query", "value"),
@@ -149,37 +156,64 @@ app.layout = html.Div(
 )
 def on_search(n_clicks, query, topk):
     if not n_clicks:
-        return html.Div("Enter a question and click Search."), []
+        return html.Div("Enter a question and click Ask."), "", "", []
 
     if not query or not query.strip():
-        return html.Div("Please enter a question.", style={"color": "crimson"}), []
+        msg = html.Div("Please enter a question.", style={"color": "crimson"})
+        return msg, "", "", []
 
-    # Basic index existence check
     if not os.path.exists(PERSIST_DIR):
-        return html.Div(
+        msg = html.Div(
             f"Vector index not found at {PERSIST_DIR}. Run: python retrieval/build_index.py",
             style={"color": "crimson"},
-        ), []
+        )
+        return msg, "", "", []
 
     try:
-        out = run_search(query.strip(), int(topk))
+        out = answer_with_llm(query.strip(), k=int(topk), model="gpt-4o-mini")
     except Exception as e:
-        return html.Div(f"Search failed: {e}", style={"color": "crimson"}), []
+        msg = html.Div(f"RAG call failed: {e}", style={"color": "crimson"})
+        return msg, "", "", []
 
-    ids = out.get("ids", [[]])[0]
-    if not ids:
-        return html.Div("No results returned."), []
+    refused = out.get("refused", False)
+    status = html.Div(
+        "Refused (low-confidence retrieval). Try rephrasing."
+        if refused
+        else "Answered from retrieved WCAG 2.2 sources."
+    )
+
+    answer_text = out.get("answer", "")
+    citations = out.get("citations", []) or []
+    results = out.get("results", []) or []
+
+    if citations:
+        citations_box = html.Ul(
+            [
+                html.Li(
+                    [
+                        html.Span(
+                            f"{c.get('sc_id','')} ({c.get('level','')}) — {c.get('sc_title','')} "
+                        ),
+                        html.A(
+                            "source",
+                            href=c.get("url", ""),
+                            target="_blank",
+                            rel="noreferrer",
+                        ),
+                    ]
+                )
+                for c in citations
+            ]
+        )
+    else:
+        citations_box = html.Div("(No citations)")
 
     cards = []
-    for i in range(len(ids)):
-        meta = out["metadatas"][0][i]
-        dist = out["distances"][0][i]
-        doc = out["documents"][0][i]
-        cards.append(result_card(i, meta, dist, doc))
+    for i, r in enumerate(results):
+        cards.append(result_card(i, r["meta"], r["distance"], r["text"]))
 
-    return html.Div(f"Retrieved {len(ids)} chunks."), cards
+    return status, answer_text, citations_box, cards
 
 
 if __name__ == "__main__":
-    # Tip: set debug=False once stable
     app.run_server(debug=True)
