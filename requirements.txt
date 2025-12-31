@@ -1,0 +1,8 @@
+dash>=2.14
+chromadb>=0.4.24
+sentence-transformers>=2.2.2
+openai>=1.40.0
+beautifulsoup4>=4.12
+lxml>=5.1
+numpy>=1.23
+scikit-learn>=1.3
